@@ -2,7 +2,8 @@ import glob
 import os
 import time
 import logging
-from typing import Optional
+import asyncio
+from typing import Optional, Union
 from functools import wraps
 
 from dotenv import load_dotenv
@@ -39,6 +40,27 @@ if not TOKEN:
 # Инициализация бота
 bot = TeleBot(TOKEN)
 
+# Глобальный экземпляр бота для использования в других модулях
+strava_bot = None
+
+async def send_message_to_user(user_id: Union[int, str], text: str) -> None:
+    """
+    Отправка сообщения пользователю через Telegram бота
+    
+    Args:
+        user_id: ID пользователя в Telegram
+        text: Текст сообщения
+    """
+    if strava_bot is None:
+        logger.error("StravaBot не инициализирован")
+        return
+        
+    try:
+        strava_bot.bot.send_message(user_id, text)
+        logger.info(f"Сообщение успешно отправлено пользователю {user_id}")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке сообщения пользователю {user_id}: {e}")
+
 class StravaBot:
     MEDIA_DIR = 'media'
     
@@ -48,6 +70,8 @@ class StravaBot:
         self.setup_handlers()
         self._ensure_media_dir_exists()
         logger.info("StravaBot успешно инициализирован")
+        global strava_bot
+        strava_bot = self
     
     def _ensure_media_dir_exists(self):
         """Создание папки для медиафайлов, если она не существует"""
@@ -104,12 +128,12 @@ class StravaBot:
                 logger.warning(f"Файл не найден: {path}")
                 missing_files.append(path)
         
-        if missing_files:
-            logger.warning(f"Не найдены файлы: {', '.join(missing_files)}")
-            self.bot.send_message(
-                chat_id,
-                f"Не удалось найти следующие файлы:\n{nl.join(missing_files)}"
-            )
+        # if missing_files:
+        #     logger.warning(f"Не найдены файлы: {', '.join(missing_files)}")
+        #     self.bot.send_message(
+        #         chat_id,
+        #         f"Не удалось найти следующие файлы:\n{nl.join(missing_files)}"
+        #     )
         
         if media:
             try:
@@ -129,10 +153,16 @@ class StravaBot:
                 "Нет доступных медиафайлов для отправки"
             )
             
-    @error_handler
-    def get_training_data(self, message: Message) -> None:
-        """Получение данных о последней тренировке"""
-        user_id = message.chat.id
+    def get_training_data(self, message_or_user_id: Union[Message, int]) -> str:
+        """
+        Синхронная версия получения данных о последней тренировке
+        
+        Args:
+            message_or_user_id: Объект сообщения или ID пользователя
+        """
+        # Определяем user_id в зависимости от типа входного параметра
+        user_id = message_or_user_id.chat.id if isinstance(message_or_user_id, Message) else message_or_user_id
+        
         logger.info(f"Запрос данных о последней тренировке от пользователя {user_id}")
         
         self._ensure_media_dir_exists()  # Проверяем наличие папки
@@ -140,20 +170,34 @@ class StravaBot:
         
         text = generation_analyse(user_id)
         logger.info("Анализ тренировки сгенерирован")
-        self.bot.send_message(user_id, text=text)
+        
+        # Отправляем сообщение только если это запрос из чата
+        if isinstance(message_or_user_id, Message):
+            self.bot.send_message(user_id, text=text)
 
-        media_files = [
-            f'{self.MEDIA_DIR}/map.png',
-            f'{self.MEDIA_DIR}/graph_by_power.png',
-            f'{self.MEDIA_DIR}/graph_by_hr.png'
-        ]
-        logger.info(f"Подготовлен список медиафайлов: {media_files}")
+            media_files = [
+                f'{self.MEDIA_DIR}/map.png',
+                f'{self.MEDIA_DIR}/graph_by_power.png',
+                f'{self.MEDIA_DIR}/graph_by_hr.png'
+            ]
+            logger.info(f"Подготовлен список медиафайлов: {media_files}")
+            
+            self.send_media_files(user_id, media_files)
+            logger.info("Медиафайлы отправлены")
+            
+            self.cleanup_media()
+            logger.info("Медиафайлы очищены")
         
-        self.send_media_files(user_id, media_files)
-        logger.info("Медиафайлы отправлены")
+        return text
+
+    async def async_get_training_data(self, message_or_user_id: Union[Message, int]) -> str:
+        """
+        Асинхронная версия получения данных о последней тренировке
         
-        self.cleanup_media()
-        logger.info("Медиафайлы очищены")
+        Args:
+            message_or_user_id: Объект сообщения или ID пользователя
+        """
+        return self.get_training_data(message_or_user_id)
 
     @error_handler
     def get_progress(self, message: Message) -> None:
@@ -353,6 +397,9 @@ def run_bot():
             logger.info("Перезапуск бота через 5 секунд...")
             time.sleep(5)
             continue
+
+# Экспортируем функции для использования в других модулях
+__all__ = ['send_message_to_user', 'StravaBot']
 
 if __name__ == '__main__':
     logger.info("Запуск приложения...")

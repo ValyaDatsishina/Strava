@@ -1,3 +1,5 @@
+version: '3.8'
+
 #DATABASE
 services:
   mongo_db:
@@ -35,8 +37,22 @@ services:
     networks:
       - custom
     depends_on:
-      mongo_db
+      - mongo_db
     restart: unless-stopped
+
+  webhook:
+    build: .
+    command: uvicorn webhook:app --host 0.0.0.0 --port 8000
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongo_db
+      - strava
+    restart: always
 
 networks:
   custom:
