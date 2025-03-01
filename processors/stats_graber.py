@@ -1,204 +1,240 @@
-import requests as r
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Optional, Any
+import logging
+from functools import lru_cache
+
+import requests
+from requests.exceptions import RequestException
+
 from db.training import post_many_training
 from db.mongo import db_connect
-from main import status_code_checker
 from processors.graph_creater import create_graph_by_data
 from users import users_data
 
-url = 'https://www.strava.com/api/v3/athlete/activities'
+logger = logging.getLogger(__name__)
 
+@dataclass
+class ActivityTypes:
+    BIKE = ['VirtualRide', 'Ride']
+    RUN = ['Run', 'TrailRun']
 
-def get_list_of_training(user_id: int) -> list:
-    token = users_data[f'{user_id}']['access_token']
-    params = {'access_token': token,
-              'per_page': 200,
-              'page': 1}
-    response = status_code_checker(url, params, user_id)
+@dataclass
+class TrainingStats:
+    week_time: str
+    month_time: str
+    year_time: str
+    total_time: str
+    week_tss: float
+    six_weeks_tss: float
+    tbs: float
 
-    if type(response) == str:
-        new_token = response
-        params['access_token'] = new_token
+class StravaStatsAnalyzer:
+    BASE_URL = 'https://www.strava.com/api/v3/athlete/activities'
+    
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        self.session = requests.Session()
+        
+    def get_list_of_training(self, limit: Optional[int] = None) -> list[dict]:
+        """Получение списка тренировок с API Strava"""
+        token = users_data[str(self.user_id)]['access_token']
+        params = {
+            'access_token': token,
+            'per_page': min(limit, 200) if limit else 200,
+            'page': 1
+        }
+        
+        trainings = []
+        try:
+            while True:
+                response = self.session.get(self.BASE_URL, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                if not data or (limit and len(trainings) >= limit):
+                    break
+                    
+                trainings.extend(data[:limit - len(trainings)] if limit else data)
+                params['page'] += 1
+                
+        except RequestException as e:
+            logger.error(f"Error fetching training data: {e}")
+            return []
+            
+        if trainings:
+            post_many_training(trainings, self.user_id)
+        return trainings
 
-    list_of_training = []
+    @staticmethod
+    def _parse_date(date_str: str) -> datetime:
+        """Парсинг даты из строки"""
+        return datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%SZ').date()
 
-    while True:
-        response = r.get(url, params=params).json()
-        count = len(response)
-        if count != 0:
-            for i in range(0, count):
-                list_of_training.append(response[i])
+    @staticmethod
+    def _get_power(activity: dict) -> Optional[int]:
+        """Получение данных о мощности"""
+        return activity.get('weighted_average_watts') if activity.get('device_watts') else None
 
-            next_page = params['page'] + 1
-            params['page'] = next_page
-        if count == 0:
-            break
+    @staticmethod
+    def _get_heartrate(activity: dict) -> Optional[float]:
+        """Получение данных о пульсе"""
+        return activity.get('average_heartrate')
 
-    post_many_training(list_of_training, user_id)
-    return list_of_training
+    @staticmethod
+    def _get_pace(activity: dict) -> Optional[float]:
+        """Расчет темпа"""
+        moving_time = activity.get('moving_time', 0)
+        distance = activity.get('distance', 0)
+        
+        if moving_time > 0 and distance > 0:
+            return moving_time / distance * 1000
+        return None
 
+    def _calc_tss(self, power: int, moving_time: int) -> float:
+        """Расчет TSS (Training Stress Score)"""
+        ftp = int(users_data[str(self.user_id)]['ftp'])
+        return round((power ** 2 * moving_time) / (ftp ** 2 * 3600) * 100, 1)
 
-def get_stats(user_id: int):
-    data = list(db_connect(user_id, param='training').find({}))
-    count_of_record_db = len(data)
-    all_training_count = len(get_list_of_training(user_id))
+    def analyze_training_stats(self) -> TrainingStats:
+        """Анализ статистики тренировок"""
+        data = list(db_connect(self.user_id, param='training').find({}))
+        all_trainings = self.get_list_of_training()
+        
+        if not data or len(data) < len(all_trainings):
+            self.get_full_stats()
+            data = list(db_connect(self.user_id, param='training').find({}))
+            
+        today = datetime.now().date()
+        time_periods = {
+            'week': timedelta(days=7),
+            'month': timedelta(days=31),
+            'six_weeks': timedelta(days=42),
+            'year': timedelta(days=365)
+        }
+        
+        stats = {
+            'week_seconds': 0,
+            'month_seconds': 0,
+            'year_seconds': 0,
+            'total_seconds': 0,
+            'week_tss': 0,
+            'six_weeks_tss': 0
+        }
+        
+        for activity in data:
+            activity_date = self._parse_date(activity['start_date_local'])
+            days_diff = today - activity_date
+            
+            # Обновляем время для всех периодов
+            if days_diff <= time_periods['week']:
+                stats['week_seconds'] += activity['moving_time']
+                if power := self._get_power(activity):
+                    stats['week_tss'] += self._calc_tss(power, activity['moving_time'])
+                    
+            if days_diff <= time_periods['month']:
+                stats['month_seconds'] += activity['moving_time']
+                
+            if days_diff <= time_periods['six_weeks']:
+                if power := self._get_power(activity):
+                    stats['six_weeks_tss'] += self._calc_tss(power, activity['moving_time'])
+                    
+            if days_diff <= time_periods['year']:
+                stats['year_seconds'] += activity['moving_time']
+                
+            stats['total_seconds'] += activity['moving_time']
+            
+        # Расчет средних значений TSS
+        avg_week_tss = round(stats['week_tss'] / 7, 2)
+        avg_six_weeks_tss = round(stats['six_weeks_tss'] / 42, 2)
+        tbs = round(avg_six_weeks_tss - avg_week_tss, 2)
+        
+        return TrainingStats(
+            week_time=str(timedelta(seconds=stats['week_seconds'])),
+            month_time=str(timedelta(seconds=stats['month_seconds'])),
+            year_time=str(timedelta(seconds=stats['year_seconds'])),
+            total_time=str(timedelta(seconds=stats['total_seconds'])),
+            week_tss=avg_week_tss,
+            six_weeks_tss=avg_six_weeks_tss,
+            tbs=tbs
+        )
 
-    if count_of_record_db == 0 or count_of_record_db < all_training_count:
-        get_full_stats(user_id)
-        data = list(db_connect(user_id, param='training').find({}))
+    def get_full_stats(self) -> str:
+        """Получение полной статистики"""
+        trainings = self.get_list_of_training()
+        return post_many_training(trainings, self.user_id)
 
-    today = datetime.now().date()
-    week_total_seconds = 0
-    month_total_seconds = 0
-    year_total_seconds = 0
-    total_seconds = 0
-    week_TSS = 0
-    six_weeks_TSS = 0
+    def create_tss_diagram(self):
+        """Создание диаграммы TSS"""
+        trainings = self.get_list_of_training()
+        dates = []
+        tss_values = []
+        
+        for training in trainings:
+            if training['sport_type'] in ActivityTypes.BIKE:
+                if power := self._get_power(training):
+                    dates.append(self._parse_date(training['start_date_local']))
+                    tss_values.append(self._calc_tss(power, training['moving_time']))
+                    
+        if tss_values:
+            create_graph_by_data(
+                dates, 
+                tss_values, 
+                3, 
+                'График TSS за все тренировки', 
+                'media/graph_by_TSS.png'
+            )
 
-    for i in range(0, len(data)):
-        date_of_activity = datetime.strptime(data[i]['start_date_local'], '%Y-%m-%dT%H:%M:%SZ').date()
+    def create_progress_diagrams(self):
+        """Создание диаграмм прогресса"""
+        trainings = self.get_list_of_training()
+        power_data = {'dates': [], 'ratios': []}
+        
+        for training in trainings:
+            if training['sport_type'] in ActivityTypes.BIKE:
+                if (power := self._get_power(training)) and (hr := self._get_heartrate(training)):
+                    power_data['dates'].append(self._parse_date(training['start_date_local']))
+                    power_data['ratios'].append(round(power / hr, 2))
+        
+        if power_data['ratios']:
+            create_graph_by_data(
+                power_data['dates'],
+                power_data['ratios'],
+                3,
+                'Отношение мощности к пульсу',
+                'media/graph_power_by_hr.png',
+                'Вт/удары в минуту'
+            )
 
-        if today - date_of_activity <= timedelta(days=7):
-            week_total_seconds += data[i]['moving_time']
-            month_total_seconds += data[i]['moving_time']
-            year_total_seconds += data[i]['moving_time']
-            total_seconds += data[i]['moving_time']
-            power = type_of_activity_checker(data[i])
-
-            if power:
-                moving_time = data[i]['moving_time']
-                week_TSS += calc_TSS(power, moving_time, user_id)
-                six_weeks_TSS += week_TSS
-
-        if timedelta(days=7) < today - date_of_activity <= timedelta(days=31):
-            month_total_seconds += data[i]['moving_time']
-            year_total_seconds += data[i]['moving_time']
-            total_seconds += data[i]['moving_time']
-
-            power = type_of_activity_checker(data[i])
-            if power:
-                moving_time = data[i]['moving_time']
-                six_weeks_TSS += calc_TSS(power, moving_time, user_id)
-
-        if timedelta(days=31) < today - date_of_activity <= timedelta(days=42):
-            year_total_seconds += data[i]['moving_time']
-            total_seconds += data[i]['moving_time']
-
-            power = type_of_activity_checker(data[i])
-            if power:
-                moving_time = data[i]['moving_time']
-                six_weeks_TSS += calc_TSS(power, moving_time, user_id)
-
-        if timedelta(days=42) < today - date_of_activity <= timedelta(days=365):
-            year_total_seconds += data[i]['moving_time']
-            total_seconds += data[i]['moving_time']
-        else:
-            total_seconds += data[i]['moving_time']
-
-    week_total_time = str(timedelta(seconds=week_total_seconds))
-    month_total_time = str(timedelta(seconds=month_total_seconds))
-    year_total_time = str(timedelta(seconds=year_total_seconds))
-    total_seconds_time = str(timedelta(seconds=total_seconds))
-
-    avg_week_TSS = round(week_TSS / 7, 2)
-    avg_six_weeks_TSS = round(six_weeks_TSS / 42, 2)
-    TBS = round(six_weeks_TSS / 42 - week_TSS / 7, 2)
-
-    basic_list = [week_total_time, month_total_time, year_total_time, total_seconds_time]
-
-    addons_list = [avg_week_TSS, avg_six_weeks_TSS, TBS]
-
-    if addons_list[0] and addons_list[1] and addons_list[2]:
-        basic_list.extend(addons_list)
-        return basic_list
-    else:
-        for i in range(0, 3):
-            basic_list.append('Неизвестно')
-        return basic_list
-
+def get_stats(user_id: int) -> list[Any]:
+    """Получение статистики тренировок"""
+    analyzer = StravaStatsAnalyzer(user_id)
+    stats = analyzer.analyze_training_stats()
+    return [
+        stats.week_time,
+        stats.month_time,
+        stats.year_time,
+        stats.total_time,
+        stats.week_tss if stats.week_tss else 'Неизвестно',
+        stats.six_weeks_tss if stats.six_weeks_tss else 'Неизвестно',
+        stats.tbs if stats.tbs else 'Неизвестно'
+    ]
 
 def get_full_stats(user_id: int) -> str:
-    list_of_all_training = get_list_of_training(user_id)
-    return post_many_training(list_of_all_training, user_id)
-
+    """Получение полной статистики"""
+    analyzer = StravaStatsAnalyzer(user_id)
+    return analyzer.get_full_stats()
 
 def delete_all(user_id: int):
+    """Удаление всех данных"""
     db_connect(user_id, param='delete_all')
 
-
-def type_of_activity_checker(data: dict):
-    if 'weighted_average_watts' in data:
-        return data['weighted_average_watts']
-
-def get_pace(data: dict):
-    pace_seconds_per_kilometer = None
-    if 'moving_time' in data and 'distance' in data:
-        moving_time = data['moving_time']
-        distance = data['distance']
-        if moving_time > 0 and distance > 0:
-            pace_seconds_per_kilometer = moving_time / distance * 1000
-
-    return pace_seconds_per_kilometer
-
-def get_average_hr(data: dict):
-    if 'average_heartrate' in data:
-        return data['average_heartrate']
-
-def calc_TSS(power: int, moving_time: int, user_id: int) -> int:
-    ftp = int(users_data[f'{user_id}']['ftp'])
-    tss = round((power ** 2 * moving_time) / (ftp ** 2 * 3600) * 100, 1)
-    return tss
-
 def get_TSS_diagram(user_id: int):
-    list_of_date = []
-    list_of_TSS = []
-    list_of_all_training = get_list_of_training(user_id)
+    """Создание диаграммы TSS"""
+    analyzer = StravaStatsAnalyzer(user_id)
+    analyzer.create_tss_diagram()
 
-    for i in range(0, len(list_of_all_training)):
-        if list_of_all_training[i]['sport_type'] in ['VirtualRide', 'Ride']:
-            power = type_of_activity_checker(list_of_all_training[i])
-            if power:
-                moving_time = list_of_all_training[i]['moving_time']
-                date_of_activity = datetime.strptime(list_of_all_training[i]['start_date_local'],
-                                                     '%Y-%m-%dT%H:%M:%SZ').date()
-                TSS = calc_TSS(power, moving_time, user_id)
-                list_of_date.append(date_of_activity)
-                list_of_TSS.append(TSS)
-
-    if list_of_TSS:
-        create_graph_by_data(list_of_date, list_of_TSS, 3, 'График TSS за все тренировки', 'media/graph_by_TSS.png')
-    
 def get_progress_diagrams(user_id: int):
-    list_of_date_by_power = []
-    # list_of_date_by_pace = []
-    list_of_ratio_power_by_hr = []
-    # list_of_ratio_pace_by_hr = []
-    list_of_all_training = get_list_of_training(user_id)
-    
-    for training in list_of_all_training:
-        if training['sport_type'] in ['VirtualRide', 'Ride']:
-            power = type_of_activity_checker(training)
-            hr = get_average_hr(training)
-            if power and hr:
-                date_of_activity = datetime.strptime(training['start_date_local'],
-                                                     '%Y-%m-%dT%H:%M:%SZ').date()
-                ratio = round(power / hr, 2)
-                list_of_date_by_power.append(date_of_activity)
-                list_of_ratio_power_by_hr.append(ratio)
-                continue
-
-        # if training['sport_type'] in ['Run', 'TrailRun']:
-        #     pace = get_pace(training)
-        #     hr = get_average_hr(training)
-        #     if pace and hr:
-        #         date_of_activity = datetime.strptime(training['start_date_local'],
-        #                                              '%Y-%m-%dT%H:%M:%SZ').date()
-        #         ratio = round(pace / hr, 2)
-        #         list_of_date_by_pace.append(date_of_activity)
-        #         list_of_ratio_pace_by_hr.append(ratio)
-
-    if list_of_ratio_power_by_hr:
-        create_graph_by_data(list_of_date_by_power, list_of_ratio_power_by_hr, 3, 'Отношение мощности к пульсу', 'media/graph_power_by_hr.png', 'Вт/удары в минуту')
-
-    # if list_of_ratio_pace_by_hr:
-    #     create_graph_by_data(list_of_date_by_pace, list_of_ratio_pace_by_hr, 2, 'Отношение темпа к пульсу','media/graph_pace_by_hr.png', 'Секунды на километр/удары в минуту')
+    """Создание диаграмм прогресса"""
+    analyzer = StravaStatsAnalyzer(user_id)
+    analyzer.create_progress_diagrams()

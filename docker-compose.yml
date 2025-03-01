@@ -1,38 +1,46 @@
 #DATABASE
 services:
   mongo_db:
-    image: mongo:4.4.6
+    image: mongo:4.4.27
     container_name: 'mongo_db'
     restart: always
     ports:
       - '27017:27017'
     networks:
       - custom
+    volumes:
+      - mongodb_data:/data/db
+    environment:
+      - MONGO_INITDB_DATABASE=strava
     deploy:
       restart_policy:
         condition: on-failure
         delay: 5s
 
-  #APP
-  app:
+  #STRAVA BOT
+  strava:
     container_name: 'strava'
-    image: strava
-    environment:
-      - MONGO_URI=mongodb://mongo_db/
+    image: strava:latest
     build:
       context: .
       dockerfile: Dockerfile
+    volumes:
+      - .:/app
+      - ./media:/app/media
+    environment:
+      - MONGO_URI=mongodb://mongo_db/
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - .env
     networks:
       - custom
     depends_on:
-      - mongo_db
-    env_file:
-      - .env
-    deploy:
-      restart_policy:
-        condition: on-failure
-        delay: 5s
+      mongo_db
+    restart: unless-stopped
 
 networks:
   custom:
     driver: bridge
+
+volumes:
+  mongodb_data:
