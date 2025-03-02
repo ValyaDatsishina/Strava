@@ -148,10 +148,10 @@ class StravaBot:
                 )
         else:
             logger.warning(f"Нет доступных медиафайлов для отправки пользователю {chat_id}")
-            self.bot.send_message(
-                chat_id,
-                "Нет доступных медиафайлов для отправки"
-            )
+            # self.bot.send_message(
+            #     chat_id,
+            #     "Нет доступных медиафайлов для отправки"
+            # )
             
     def get_training_data(self, message_or_user_id: Union[Message, int]) -> str:
         """

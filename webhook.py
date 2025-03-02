@@ -13,15 +13,16 @@ strava_bot = StravaBot()
 app = FastAPI()
 
 @app.get("/webhook")
-async def webhook_challenge(
-    hub_mode: str,
-    hub_challenge: str,
-    hub_verify_token: Optional[str] = None
-):
+async def webhook_challenge(request: Request):
     """
     Обработчик для подтверждения подписки на webhook.
     Strava отправляет GET запрос с hub.challenge, который нужно вернуть обратно.
     """
+    params = dict(request.query_params)
+    hub_mode = params.get("hub.mode")
+    hub_challenge = params.get("hub.challenge")
+    hub_verify_token = params.get("hub.verify_token")
+    
     logger.info(f"Получен запрос на подтверждение webhook: {hub_mode=}, {hub_challenge=}, {hub_verify_token=}")
     
     if hub_mode == "subscribe":
